@@ -18,7 +18,7 @@ public:
         return inst;
     }
 
-    void pub_odom_func(IMUST& xc)
+void pub_odom_func(IMUST& xc)
     {
         Eigen::Quaterniond q_this(xc.R);
         Eigen::Vector3d t_this = xc.p;
@@ -52,9 +52,63 @@ public:
         odom_msg.pose.pose.orientation.x = q_this.x();
         odom_msg.pose.pose.orientation.y = q_this.y();
         odom_msg.pose.pose.orientation.z = -q_this.z();
-        odom_msg.twist.twist.linear.x = v_this_imu.x();
-        odom_msg.twist.twist.linear.y = v_this_imu.y();
-        odom_msg.twist.twist.linear.z = v_this_imu.z();
+
+        // --- Pose Covariance (rotation + position: 6x6) ---
+        // Assuming xc.cov is at least 6x6, with layout: [rotation(0:3), position(3:6), ...]
+        if (xc.cov.rows() >= 6 && xc.cov.cols() >= 6) {
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    odom_msg.pose.covariance[i * 6 + j] = xc.cov(i, j);
+                }
+            }
+        }
+
+        // --- Linear velocity (world → body) ---
+        Eigen::Vector3d vel_body = xc.R.transpose() * xc.v;
+        odom_msg.twist.twist.linear.x = vel_body.x();
+        odom_msg.twist.twist.linear.y = vel_body.y();
+        odom_msg.twist.twist.linear.z = vel_body.z();
+
+        // --- Angular velocity (body frame) ---
+        // Get latest IMU measurement and subtract gyro bias
+        if (!imu_buf.empty()) {
+            mBuf.lock();
+            const sensor_msgs::Imu::Ptr& latest_imu = imu_buf.back();
+            mBuf.unlock();
+            
+            Eigen::Vector3d angvel_raw(
+                latest_imu->angular_velocity.x,
+                latest_imu->angular_velocity.y,
+                latest_imu->angular_velocity.z
+            );
+            Eigen::Vector3d angvel_corrected = angvel_raw - xc.bg;
+            
+            odom_msg.twist.twist.angular.x = angvel_corrected.x();
+            odom_msg.twist.twist.angular.y = angvel_corrected.y();
+            odom_msg.twist.twist.angular.z = angvel_corrected.z();
+        } else {
+            odom_msg.twist.twist.angular.x = 0.0;
+            odom_msg.twist.twist.angular.y = 0.0;
+            odom_msg.twist.twist.angular.z = 0.0;
+        }
+
+        // --- Twist Covariance (linear vel + angular vel: 6x6) ---
+        // Assuming xc.cov has velocity at indices [9:12] and gyro bias at [12:15]
+        // Adjust indices based on your actual IMUST state vector layout
+        if (xc.cov.rows() >= 15 && xc.cov.cols() >= 15) {
+            // Linear velocity covariance (indices 9-11 in state)
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++) {
+                    odom_msg.twist.covariance[i * 6 + j] = xc.cov(9 + i, 9 + j);
+                }
+            }
+            // Angular velocity covariance (gyro bias uncertainty, indices 12-14)
+            for (int i = 0; i < 3; i++) {
+                for (int j = 0; j < 3; j++) {
+                    odom_msg.twist.covariance[(i + 3) * 6 + (j + 3)] = xc.cov(12 + i, 12 + j);
+                }
+            }
+        }
 
         pub_odom.publish(odom_msg);
     }
@@ -3093,13 +3147,13 @@ int main(int argc, char** argv)
 extern "C" void voxel_slam_start(ros::NodeHandle& n)
 {
     // Mirror the setup done in main(), but do not call ros::spin().
-    pub_cmap = n.advertise<sensor_msgs::PointCloud2>("/map_cmap", 100);
-    pub_pmap = n.advertise<sensor_msgs::PointCloud2>("/map_pmap", 100);
-    pub_scan = n.advertise<sensor_msgs::PointCloud2>("/map_scan", 100);
-    pub_init = n.advertise<sensor_msgs::PointCloud2>("/map_init", 100);
-    pub_test = n.advertise<sensor_msgs::PointCloud2>("/map_test", 100);
-    pub_curr_path = n.advertise<sensor_msgs::PointCloud2>("/map_path", 100);
-    pub_prev_path = n.advertise<sensor_msgs::PointCloud2>("/map_true", 100);
+    pub_cmap = n.advertise<sensor_msgs::PointCloud2>("map_cmap", 10);
+    pub_pmap = n.advertise<sensor_msgs::PointCloud2>("map_pmap", 10);
+    pub_scan = n.advertise<sensor_msgs::PointCloud2>("map_scan", 10);
+    pub_init = n.advertise<sensor_msgs::PointCloud2>("map_init", 10);
+    pub_test = n.advertise<sensor_msgs::PointCloud2>("map_test", 10);
+    pub_curr_path = n.advertise<sensor_msgs::PointCloud2>("map_path", 10);
+    pub_prev_path = n.advertise<sensor_msgs::PointCloud2>("map_true", 10);
 
     VOXEL_SLAM* vs = new VOXEL_SLAM(n);
     mp = new int[vs->win_size];
