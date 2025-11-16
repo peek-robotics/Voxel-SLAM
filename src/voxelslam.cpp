@@ -1138,6 +1138,16 @@ public:
         pub_local_accum_cloud.publish(msg);
     }
 
+    void PublishLocalAccumulatedRaw(const pcl::PointCloud<PointType>::ConstPtr& scan, double stamp)
+    {
+        if (!pub_local_accumulated || !scan || scan->empty()) return;
+        sensor_msgs::PointCloud2 msg;
+        pcl::toROSMsg(*scan, msg);
+        msg.header.stamp = ros::Time(stamp);
+        msg.header.frame_id = base_link;
+        pub_local_accum_cloud.publish(msg);
+    }
+
     // The point-to-plane alignment for odometry
     bool lio_state_estimation(PVecPtr pptr)
     {
@@ -1562,6 +1572,11 @@ public:
         if (odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
             return 0;
 
+        if (pub_local_accumulated)
+        {
+            PublishLocalAccumulatedRaw(orig, odom_ekf.pcl_end_time);
+        }
+
         if (win_count == 0)
             imupre_scale_gravity = odom_ekf.scale_gravity;
 
@@ -1578,7 +1593,7 @@ public:
         x_buf.push_back(x_curr);
         pvec_buf.push_back(pptr);
         ResultOutput::instance().pub_localtraj(pwld, 0, x_curr,
-                                               sessionNames.size() - 1, pcl_path);
+                            sessionNames.size() - 1, pcl_path);
 
         if (win_count > 1)
         {
@@ -1642,6 +1657,12 @@ public:
         pvec_buf.clear();
         imu_pre_buf.clear();
         pl_tree->clear();
+
+        if (pub_local_accumulated)
+        {
+            current_scan_index_ = 0;
+            total_scans_stored_ = 0;
+        }
 
         for (int i = 0; i < win_size; i++)
             mp[i] = i;
