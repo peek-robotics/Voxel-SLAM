@@ -3,10 +3,13 @@
 #include "ros/time.h"
 #include <cstdio>
 #include <string>
+#include <sstream>
 #include <tf/transform_listener.h>
 #include <pcl/common/transforms.h>
 
 using namespace std;
+
+double motion_init_eig_threshold_ = 15.0;
 
 class ResultOutput
 {
@@ -801,7 +804,7 @@ public:
                 }
                 Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(nnt);
                 eigvalue = saes.eigenvalues();
-                is_degrade = eigvalue[0] < 15 ? true : false;
+                is_degrade = eigvalue[0] < motion_init_eig_threshold_;
 
                 converge_thre = 0.01;
                 if (converge_flag == 0)
@@ -818,7 +821,7 @@ public:
         x_curr = x_buf[win_size - 1];
         double gnm = x_curr.g.norm();
         printf("gnm: %lf %lf\n", gnm, last_g_norm);
-        if (is_degrade || gnm < 9.6 || gnm > 10.0)
+        if (is_degrade || gnm < 9.0 || gnm > 10.6)
         {
             converge_flag = 0;
         }
@@ -912,6 +915,19 @@ public:
     PGO_Edges gba_edges1, gba_edges2;
     bool is_finish = false;
 
+    // Wheel odometry sanity check support
+    ros::Subscriber sub_wheel_odom_;
+    bool wheel_odom_check_enabled_ = false;
+    string wheel_odom_topic_ = "/odometry/grover";
+    double wheel_odom_ratio_tolerance_ = 0.5;
+    double wheel_odom_min_abs_tolerance_ = 0.05;
+    double wheel_odom_timeout_sec_ = 0.5;
+    int wheel_odom_violation_limit_ = 10;
+    int wheel_odom_violation_count_ = 0;
+    ros::Time last_wheel_odom_stamp_;
+    nav_msgs::Odometry::ConstPtr last_wheel_odom_msg_;
+    mutex wheel_odom_mutex_;
+
     vector<string> sessionNames;
     string bagname, savepath;
     int is_save_map;
@@ -951,6 +967,13 @@ public:
         n.param<bool>("General/enable_local_mapping", enable_local_mapping, true);
         n.param<bool>("General/enable_loop_closure", enable_loop_closure, true);
         n.param<bool>("General/use_external_odom_tf", use_external_odom_tf, false);
+        n.param<bool>("WheelOdom/wheel_odom_check", wheel_odom_check_enabled_, false);
+        n.param<string>("WheelOdom/wheel_odom_topic", wheel_odom_topic_, string("/odometry/grover"));
+        n.param<double>("WheelOdom/wheel_odom_tolerance_ratio", wheel_odom_ratio_tolerance_, 0.5);
+        n.param<double>("WheelOdom/wheel_odom_factor", wheel_odom_ratio_tolerance_, wheel_odom_ratio_tolerance_);
+        n.param<double>("WheelOdom/wheel_odom_min_tolerance", wheel_odom_min_abs_tolerance_, 0.05);
+        n.param<int>("WheelOdom/wheel_odom_violation_frames", wheel_odom_violation_limit_, 10);
+        n.param<double>("WheelOdom/wheel_odom_timeout", wheel_odom_timeout_sec_, 0.5);
         // Local accumulated parameters
         n.param<int>("LocalAccumulated/rolling_buffer_size", rolling_buffer_size_, 20);
         n.param<double>("LocalAccumulated/cropbox_min_x", cropbox_min_x_, -50.0);
@@ -980,6 +1003,15 @@ public:
                     n.subscribe<sensor_msgs::PointCloud2>(lid_topic, 1000, pcl_handler);
         odom_ekf.imu_topic = imu_topic;
 
+        if (wheel_odom_check_enabled_)
+        {
+            sub_wheel_odom_ = n.subscribe<nav_msgs::Odometry>(wheel_odom_topic_, 50,
+                                                              &VOXEL_SLAM::wheelOdomCallback, this);
+            ROS_INFO_STREAM("Wheel odom sanity check enabled on " << wheel_odom_topic_
+                            << " (ratio tolerance " << wheel_odom_ratio_tolerance_
+                            << ", frames " << wheel_odom_violation_limit_ << ")");
+        }
+
         pub_odom = n.advertise<nav_msgs::Odometry>(odom_pub_topic, 10);
         if (pub_local_accumulated)
         {
@@ -1000,6 +1032,10 @@ public:
         n.param<double>("Odometry/min_eigen_value", min_eigen_value, 0.0025);
         n.param<int>("Odometry/degrade_bound", degrade_bound, 10);
         n.param<int>("Odometry/point_notime", point_notime, 0);
+        n.param<double>("Initialization/motion_init_eigen_threshold",
+                motion_init_eig_threshold_, 15.0);
+        ROS_INFO_STREAM("Motion init eigen threshold: "
+                << motion_init_eig_threshold_);
         odom_ekf.point_notime = point_notime;
 
         feat.blind = feat.blind * feat.blind;
@@ -1087,6 +1123,98 @@ public:
             {
                 ROS_WARN_STREAM("Failed to get initial TF(" << odom_link << "->" << base_link << "): " << ex.what());
             }
+        }
+    }
+
+    void wheelOdomCallback(const nav_msgs::Odometry::ConstPtr& msg)
+    {
+        lock_guard<mutex> lock(wheel_odom_mutex_);
+        last_wheel_odom_msg_ = msg;
+        last_wheel_odom_stamp_ = msg->header.stamp;
+        if (wheel_odom_violation_count_ > wheel_odom_violation_limit_)
+            wheel_odom_violation_count_ = 0;
+    }
+
+    bool evaluateWheelOdomSanity(double slam_vx_body, string& error_msg)
+    {
+        if (!wheel_odom_check_enabled_)
+            return true;
+
+        nav_msgs::Odometry::ConstPtr wheel_msg;
+        ros::Time wheel_stamp;
+        {
+            lock_guard<mutex> lock(wheel_odom_mutex_);
+            wheel_msg = last_wheel_odom_msg_;
+            wheel_stamp = last_wheel_odom_stamp_;
+        }
+
+        if (!wheel_msg)
+            return true;
+
+        if (wheel_odom_timeout_sec_ > 0.0 && (ros::Time::now() - wheel_stamp).toSec() > wheel_odom_timeout_sec_)
+            return true; // stale data, skip check
+
+        const double wheel_vx = wheel_msg->twist.twist.linear.x;
+        const double tolerance = max(fabs(wheel_vx) * wheel_odom_ratio_tolerance_, wheel_odom_min_abs_tolerance_);
+        const double diff = fabs(slam_vx_body - wheel_vx);
+        bool trigger_reset = false;
+
+        if (diff > tolerance)
+        {
+            lock_guard<mutex> lock(wheel_odom_mutex_);
+            wheel_odom_violation_count_++;
+            if (wheel_odom_violation_count_ >= wheel_odom_violation_limit_)
+            {
+                trigger_reset = true;
+                wheel_odom_violation_count_ = 0;
+            }
+        }
+        else
+        {
+            lock_guard<mutex> lock(wheel_odom_mutex_);
+            wheel_odom_violation_count_ = 0;
+        }
+
+        if (trigger_reset)
+        {
+            ostringstream oss;
+            oss << "Wheel odom sanity check failed: slam_vx=" << slam_vx_body
+                << " wheel_vx=" << wheel_vx << " tolerance=" << tolerance
+                << " (ratio " << wheel_odom_ratio_tolerance_ * 100.0 << "%,"
+                << " frames=" << wheel_odom_violation_limit_ << ")";
+            error_msg = oss.str();
+            return false;
+        }
+
+        return true;
+    }
+
+    void forceReset(const string& reason, deque<sensor_msgs::Imu::Ptr>& imus,
+                    Eigen::Vector3d& last_pos, double& jour, bool& motion_init_flag,
+                    bool log_error)
+    {
+        if (log_error)
+            ROS_ERROR_STREAM(reason);
+        else
+            ROS_WARN_STREAM(reason);
+
+        system_reset(imus);
+        last_pos = x_curr.p;
+        jour = 0;
+
+        {
+            lock_guard<mutex> lock(mtx_loop);
+            buf_lba2loop_tem.swap(buf_lba2loop);
+        }
+
+        reset_flag = 1;
+        motion_init_flag = true;
+        history_kfsize = 0;
+
+        if (wheel_odom_check_enabled_)
+        {
+            lock_guard<mutex> lock(wheel_odom_mutex_);
+            wheel_odom_violation_count_ = 0;
         }
     }
 
@@ -1581,7 +1709,7 @@ public:
             imupre_scale_gravity = odom_ekf.scale_gravity;
 
         PVecPtr pptr(new PVec);
-        double downkd = down_size >= 0.5 ? down_size : 0.5;
+        double downkd = down_size >= 0.25 ? down_size : 0.25; // 0.5
         down_sampling_voxel(*pcl_curr, downkd);
         var_init(extrin_para, *pcl_curr, pptr, dept_err, beam_err);
         lio_state_estimation_kdtree(pptr);
@@ -1860,7 +1988,7 @@ public:
         int counter = 0;
 
         pcl::PointCloud<PointType>::Ptr pcl_curr(new pcl::PointCloud<PointType>());
-        int motion_init_flag = 1;
+        bool motion_init_flag = true;
         pl_tree.reset(new pcl::PointCloud<PointType>());
         vector<pcl::PointCloud<PointType>::Ptr> pl_origs;
         vector<double> beg_times;
@@ -1986,7 +2114,7 @@ public:
 
                 if (init == 1)
                 {
-                    motion_init_flag = 0;
+                    motion_init_flag = false;
                 }
                 else
                 {
@@ -2016,18 +2144,62 @@ public:
                 PVecPtr pptr(new PVec);
                 var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
 
-                if (lio_state_estimation(pptr))
+                // Run state estimation
+                bool estimation_success = lio_state_estimation(pptr);
+
+                // Motion Stability Check (Phase 1 Degeneration Improvement)
+                // Compute rotation magnitude from last frame to detect rapid rotations
+                double rotation_angle_deg = 0.0;
+                bool motion_stable = true;
+                if (win_count > 0) {
+                    // Compute relative rotation from last frame
+                    Eigen::Matrix3d delta_R = x_buf[win_count-1].R.transpose() * x_curr.R;
+                    Eigen::AngleAxisd angle_axis(delta_R);
+                    rotation_angle_deg = angle_axis.angle() * 57.295779513; // rad to deg
+                    
+                    // Motion is considered unstable if rotation exceeds threshold
+                    // 5 degrees per scan is reasonable for agricultural robots
+                    const double rotation_stability_threshold = 5.0;
+                    motion_stable = (rotation_angle_deg < rotation_stability_threshold);
+                    
+                    if (!motion_stable) {
+                        ROS_WARN_THROTTLE(1.0, "Motion unstable: rotation %.2f deg (threshold %.1f deg)", 
+                                         rotation_angle_deg, rotation_stability_threshold);
+                    }
+                }
+
+                // Adaptive degeneration counter logic:
+                // - Decrement if estimation succeeded AND motion is stable
+                // - Increment if estimation failed (regardless of stability)
+                // - No change if estimation succeeded but motion is unstable (give system benefit of doubt)
+                if (estimation_success && motion_stable)
                 {
                     if (degrade_cnt > 0)
                         degrade_cnt--;
                 }
-                else
+                else if (!estimation_success)
+                {
                     degrade_cnt++;
+                    ROS_WARN_THROTTLE(1.0, "Estimation failed, degrade_cnt: %d / %d (rotation: %.2f deg)",
+                                     degrade_cnt, degrade_bound, rotation_angle_deg);
+                }
 
                 pwld.clear();
                 pvec_update(pptr, x_curr, pwld);
                 ResultOutput::instance().pub_localtraj(
                         pwld, jour, x_curr, sessionNames.size() - 1, pcl_path);
+
+                if (wheel_odom_check_enabled_)
+                {
+                    const Eigen::Vector3d vel_body = x_curr.R.transpose() * x_curr.v;
+                    string wheel_error;
+                    if (!evaluateWheelOdomSanity(vel_body.x(), wheel_error))
+                    {
+                        forceReset(wheel_error, imus, last_pos, jour, motion_init_flag,
+                                   true);
+                        continue;
+                    }
+                }
 
                 // Publish local accumulated cloud (current frame as reference)
                 if (pub_local_accumulated)
@@ -2067,24 +2239,40 @@ public:
                 multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
                 t3 = ros::Time::now().toSec();
 
+                // Graduated Degeneration Response (Phase 2 Improvement)
+                // Instead of immediate reset, progressively adapt to degraded conditions
                 if (degrade_cnt > degrade_bound)
                 {
-                    degrade_cnt = 0;
-                    ROS_WARN("Degraded, Reset %d", degrade_cnt);
-                    system_reset(imus);
-
-                    last_pos = x_curr.p;
-                    jour = 0;
-
-                    mtx_loop.lock();
-                    buf_lba2loop_tem.swap(buf_lba2loop);
-                    mtx_loop.unlock();
-                    reset_flag = 1;
-
-                    motion_init_flag = 1;
-                    history_kfsize = 0;
-
-                    continue;
+                    ROS_WARN("Degeneration detected: count=%d, bound=%d", degrade_cnt, degrade_bound);
+                    
+                    // Level 1 (moderate degradation): Continue but with warning
+                    // The system can still operate, just less reliably
+                    if (degrade_cnt <= degrade_bound + 10) {
+                        ROS_WARN_THROTTLE(1.0, "Level 1 Degeneration: Continuing with reduced confidence (cnt=%d)", 
+                                         degrade_cnt);
+                        // Future: Could increase LiDAR measurement noise in EKF here
+                        // For now, just continue and let degrade_cnt keep tracking
+                    }
+                    
+                    // Level 2 (severe degradation): More aggressive measures
+                    else if (degrade_cnt <= degrade_bound + 20) {
+                        ROS_WARN_THROTTLE(1.0, "Level 2 Degeneration: Severe feature loss (cnt=%d)", 
+                                         degrade_cnt);
+                        // Future: Could constrain optimization to translation only
+                        // Agricultural corridors typically have good heading constraints
+                    }
+                    
+                    // Level 3 (critical degradation): Full reset as last resort
+                    else {
+                        const int degrade_snapshot = degrade_cnt;
+                        degrade_cnt = 0;
+                        ostringstream oss;
+                        oss << "Level 3 Degeneration: Full reset triggered (cnt=" << degrade_snapshot
+                            << ", bound=" << degrade_bound << ")";
+                        ROS_ERROR("%s", oss.str().c_str());
+                        forceReset(oss.str(), imus, last_pos, jour, motion_init_flag, false);
+                        continue;
+                    }
                 }
             }
 
@@ -2108,13 +2296,16 @@ public:
                     opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
                 }
 
-                ScanPose* bl = new ScanPose(x_buf[0], pvec_buf[0]);
-                bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-                for (int i = 0; i < 6; i++)
-                    bl->v6[i] = 1.0 / fabs(bl->v6[i]);
-                mtx_loop.lock();
-                buf_lba2loop.push_back(bl);
-                mtx_loop.unlock();
+                if (enable_loop_closure)
+                {
+                    ScanPose* bl = new ScanPose(x_buf[0], pvec_buf[0]);
+                    bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
+                    for (int i = 0; i < 6; i++)
+                        bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+                    mtx_loop.lock();
+                    buf_lba2loop.push_back(bl);
+                    mtx_loop.unlock();
+                }
 
                 x_curr.R = x_buf[win_count - 1].R;
                 x_curr.p = x_buf[win_count - 1].p;
